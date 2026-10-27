@@ -15,11 +15,18 @@ import urllib.request
 from typing import Any
 
 
-BASE_URL = "https://apihub.agnes-ai.com"
-TEXT_MODEL = "agnes-2.0-flash"
-IMAGE_MODEL = "agnes-image-2.1-flash"
-VIDEO_MODEL = "agnes-video-v2.0"
+# api.agnes-ai.cn is the current platform host (text verified 2026-10-27; image endpoint verified live).
+# Legacy host apihub.agnes-ai.com remains a fallback for older accounts/keys.
+BASE_URL = "https://api.agnes-ai.cn"
+TEXT_BASE_URL = "https://api.agnes-ai.cn"
+TEXT_MODEL = "agnes-3.0-flash"
+IMAGE_MODEL = "agnes-image-2.5-flash"
+VIDEO_MODEL = "agnes-video-2.5-flash"
 SIZE_RE = re.compile(r"^[1-9]\d*x[1-9]\d*$")
+VIDEO_ASPECT_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
+VIDEO_SECONDS_RE = re.compile(r"^([4-9]|1[0-2])$")
+SIZE_TIER_RE = re.compile(r"^[1-4]K$")
+SUPPORTED_RATIOS = ("1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9")
 
 
 def get_api_key() -> str:
@@ -32,10 +39,10 @@ def get_api_key() -> str:
     )
 
 
-def request_json(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def request_json(method: str, path: str, payload: dict[str, Any] | None = None, base_url: str | None = None) -> dict[str, Any]:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        BASE_URL + path,
+        (base_url or BASE_URL) + path,
         data=body,
         method=method,
         headers={
@@ -54,10 +61,10 @@ def request_json(method: str, path: str, payload: dict[str, Any] | None = None) 
         raise SystemExit(f"Request failed for {path}: {exc}") from exc
 
 
-def request_text(method: str, path: str, payload: dict[str, Any] | None = None) -> str:
+def request_text(method: str, path: str, payload: dict[str, Any] | None = None, base_url: str | None = None) -> str:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        BASE_URL + path,
+        (base_url or BASE_URL) + path,
         data=body,
         method=method,
         headers={
@@ -75,8 +82,8 @@ def request_text(method: str, path: str, payload: dict[str, Any] | None = None) 
         raise SystemExit(f"Request failed for {path}: {exc}") from exc
 
 
-def stream_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    raw = request_text("POST", "/v1/chat/completions", payload)
+def stream_summary(payload: dict[str, Any], base_url: str | None = None) -> dict[str, Any]:
+    raw = request_text("POST", "/v1/chat/completions", payload, base_url=base_url)
     event_count = 0
     done = False
     content_parts: list[str] = []
@@ -139,9 +146,8 @@ def translate_prompt_to_english(prompt: str) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,
-        "max_tokens": 800,
     }
-    data = request_json("POST", "/v1/chat/completions", payload)
+    data = request_json("POST", "/v1/chat/completions", payload, base_url=TEXT_BASE_URL)
     try:
         translated = data["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, TypeError) as exc:
@@ -216,6 +222,12 @@ def extract_video_urls(data: dict[str, Any]) -> list[str]:
         value = data.get(key)
         if isinstance(value, str) and value.startswith(("http://", "https://")):
             urls.append(value)
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("video_url", "url"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                urls.append(value)
     if isinstance(data.get("data"), list):
         for item in data["data"]:
             if isinstance(item, dict):
@@ -243,21 +255,66 @@ def retrieve_video(identifier: str, model_name: str | None = VIDEO_MODEL) -> dic
     return request_json("GET", f"/v1/videos/{urllib.parse.quote(identifier, safe='')}")
 
 
-def validate_size(value: str | None, name: str = "size") -> None:
-    if value and not SIZE_RE.match(value):
-        raise SystemExit(f"Invalid {name}: {value}. Expected WIDTHxHEIGHT, for example 1024x768.")
+def normalize_size(value: str | None) -> str | None:
+    """Accept tier sizes (1K/2K/3K/4K, case-insensitive) or legacy WIDTHxHEIGHT."""
+    if not value:
+        return None
+    value = value.strip()
+    tier = re.match(r"^([1-4])k$", value, re.IGNORECASE)
+    if tier:
+        return f"{tier.group(1)}K"
+    if SIZE_RE.match(value):
+        return value
+    raise SystemExit(
+        f"Invalid size: {value}. Use a tier (1K/2K/3K/4K) or WIDTHxHEIGHT, e.g. 1024x768."
+    )
 
 
-def validate_video_args(args: argparse.Namespace) -> None:
-    if args.num_frames is not None:
-        if args.num_frames > 441 or (args.num_frames - 1) % 8 != 0:
-            raise SystemExit("Invalid --num-frames: must be <= 441 and satisfy 8n + 1, for example 81 or 121.")
-    if args.frame_rate is not None and not (1 <= args.frame_rate <= 60):
-        raise SystemExit("Invalid --frame-rate: supported range is 1-60.")
-    for name in ("height", "width"):
-        value = getattr(args, name)
-        if value is not None and value <= 0:
-            raise SystemExit(f"Invalid --{name.replace('_', '-')}: must be a positive integer.")
+def validate_ratio(value: str | None) -> None:
+    if value and value not in SUPPORTED_RATIOS:
+        raise SystemExit(
+            f"Invalid ratio: {value}. Supported: {', '.join(SUPPORTED_RATIOS)}."
+        )
+
+
+def resolve_video_mode(args: argparse.Namespace) -> str:
+    """Explicit --mode wins; otherwise infer from provided media."""
+    if args.mode:
+        return args.mode
+    if args.first_frame or args.last_frame:
+        return "keyframe"
+    if args.image or args.audio:
+        return "reference"
+    return "text"
+
+
+def validate_video_args(args: argparse.Namespace) -> str:
+    mode = resolve_video_mode(args)
+    if not VIDEO_SECONDS_RE.match(str(args.seconds)):
+        raise SystemExit(f"Invalid --seconds: {args.seconds}. Use an integer 4-12, e.g. 5.")
+    if args.size != "720P":
+        raise SystemExit("Invalid --size: agnes-video-2.5-flash only supports 720P.")
+    if args.aspect_ratio and args.aspect_ratio not in VIDEO_ASPECT_RATIOS:
+        raise SystemExit(
+            f"Invalid --aspect-ratio: {args.aspect_ratio}. Supported: {', '.join(VIDEO_ASPECT_RATIOS)}."
+        )
+    if mode == "text" and (args.first_frame or args.last_frame or args.image or args.audio):
+        raise SystemExit("text mode does not accept --first-frame/--last-frame/--image/--audio.")
+    if mode == "keyframe":
+        if not (args.first_frame or args.last_frame):
+            raise SystemExit("keyframe mode requires --first-frame and/or --last-frame.")
+        if args.image or args.audio:
+            raise SystemExit("keyframe mode does not accept --image/--audio.")
+    if mode == "reference":
+        if args.first_frame or args.last_frame:
+            raise SystemExit("reference mode does not accept --first-frame/--last-frame.")
+        if not (args.image or args.audio):
+            raise SystemExit("reference mode requires --image and/or --audio.")
+        if args.image and len(args.image) > 5:
+            raise SystemExit("reference mode supports at most 5 images on agnes-video-2.5-flash.")
+        if args.audio and len(args.audio) > 3:
+            raise SystemExit("reference mode supports at most 3 audios on agnes-video-2.5-flash.")
+    return mode
 
 
 def cmd_text(args: argparse.Namespace) -> None:
@@ -269,7 +326,6 @@ def cmd_text(args: argparse.Namespace) -> None:
         "model": TEXT_MODEL,
         "messages": messages,
         "temperature": args.temperature,
-        "max_tokens": args.max_tokens,
     }
     if args.top_p is not None:
         payload["top_p"] = args.top_p
@@ -279,10 +335,12 @@ def cmd_text(args: argparse.Namespace) -> None:
         payload["tools"] = parse_json_arg("--tools-json", args.tools_json)
     if args.tool_choice_json:
         payload["tool_choice"] = parse_json_arg("--tool-choice-json", args.tool_choice_json)
+    if args.thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
     if args.stream:
-        print_json(stream_summary(payload))
+        print_json(stream_summary(payload, base_url=TEXT_BASE_URL))
     else:
-        data = request_json("POST", "/v1/chat/completions", payload)
+        data = request_json("POST", "/v1/chat/completions", payload, base_url=TEXT_BASE_URL)
         content = extract_text_content(data)
         wrapped = {
             "type": "text",
@@ -293,14 +351,17 @@ def cmd_text(args: argparse.Namespace) -> None:
 
 
 def cmd_image(args: argparse.Namespace) -> None:
-    validate_size(args.size)
+    size = normalize_size(args.size)
+    validate_ratio(args.ratio)
     prompt, translated_prompt = prepare_generation_prompt(args.prompt, not args.no_translate_prompt)
     payload: dict[str, Any] = {
         "model": IMAGE_MODEL,
         "prompt": prompt,
     }
-    if args.size:
-        payload["size"] = args.size
+    if size:
+        payload["size"] = size
+        if SIZE_TIER_RE.match(size):
+            payload["ratio"] = args.ratio
     extra: dict[str, Any] = {"response_format": "url"}
     if args.image:
         extra["image"] = args.image
@@ -319,35 +380,30 @@ def cmd_image(args: argparse.Namespace) -> None:
 
 
 def video_payload(args: argparse.Namespace) -> dict[str, Any]:
-    validate_video_args(args)
+    mode = validate_video_args(args)
     prompt, translated_prompt = prepare_generation_prompt(args.prompt, not args.no_translate_prompt)
     args._prompt_used = prompt
     args._translated_prompt = translated_prompt
     payload: dict[str, Any] = {
         "model": VIDEO_MODEL,
         "prompt": prompt,
+        "mode": mode,
+        "size": args.size,
+        "seconds": str(args.seconds),
+        "aspect_ratio": args.aspect_ratio,
     }
-    for name in (
-        "height",
-        "width",
-        "num_frames",
-        "frame_rate",
-        "num_inference_steps",
-        "seed",
-        "negative_prompt",
-    ):
-        value = getattr(args, name)
-        if value is not None:
-            payload[name] = value
-    if args.mode:
-        payload["mode"] = args.mode
-    if args.image:
-        if len(args.image) == 1 and args.mode != "keyframes":
-            payload["image"] = args.image[0]
-        else:
-            payload["extra_body"] = {"image": args.image}
-            if args.mode:
-                payload["extra_body"]["mode"] = args.mode
+    if args.seed is not None:
+        payload["seed"] = args.seed
+    if mode == "keyframe":
+        if args.first_frame:
+            payload["first_frame"] = args.first_frame
+        if args.last_frame:
+            payload["last_frame"] = args.last_frame
+    elif mode == "reference":
+        if args.image:
+            payload["images"] = args.image
+        if args.audio:
+            payload["audios"] = args.audio
     return payload
 
 
@@ -368,8 +424,27 @@ def poll_video(identifier: str, timeout: int, interval: int) -> dict[str, Any]:
     raise SystemExit(f"Timed out waiting for video {identifier}. Last response: {json.dumps(last)}")
 
 
+def create_video_task(payload: dict[str, Any], attempts: int = 6, base_delay: int = 40) -> dict[str, Any]:
+    """Create a video task, retrying with backoff on provider queue-full (503)."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return request_json("POST", "/v1/videos", payload)
+        except SystemExit as exc:
+            message = str(exc)
+            if "HTTP 503" in message and "video_queue_full" in message and attempt < attempts:
+                wait = base_delay * attempt
+                print(
+                    f"video queue full, retry {attempt}/{attempts - 1} in {wait}s",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            raise
+    raise SystemExit("video create failed: queue stayed full after retries")
+
+
 def cmd_video(args: argparse.Namespace) -> None:
-    created = request_json("POST", "/v1/videos", video_payload(args))
+    created = create_video_task(video_payload(args))
     if not args.poll:
         identifier, id_kind = video_lookup_id(created)
         next_steps = []
@@ -463,7 +538,7 @@ def extract_image_url(data: dict[str, Any]) -> str:
 
 
 def create_video_case(name: str, payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    created = request_json("POST", "/v1/videos", payload)
+    created = create_video_task(payload)
     require_video_ok(f"{name}-create", created)
     identifier, id_kind = video_lookup_id(created)
     if not identifier:
@@ -479,28 +554,20 @@ def create_video_case(name: str, payload: dict[str, Any], args: argparse.Namespa
     return {"create": created, "get": retrieved}
 
 
-VIDEO_CASES = ("text-to-video", "image-to-video", "multi-image", "keyframes")
+VIDEO_CASES = ("text", "keyframe", "reference-image")
 
 
 def cmd_smoke_test(args: argparse.Namespace) -> None:
-    validate_size(args.image_size, "image-size")
-    validate_video_args(
-        argparse.Namespace(
-            num_frames=args.video_num_frames,
-            frame_rate=args.video_frame_rate,
-            height=args.video_height,
-            width=args.video_width,
-        )
-    )
+    args.image_size = normalize_size(args.image_size)
     text = request_json(
         "POST",
         "/v1/chat/completions",
         {
             "model": TEXT_MODEL,
             "messages": [{"role": "user", "content": "Reply with exactly: Agnes text ok"}],
-            "max_tokens": 20,
             "temperature": 0,
         },
+        base_url=TEXT_BASE_URL,
     )
     require_ok("text", text, ("choices",))
 
@@ -508,10 +575,10 @@ def cmd_smoke_test(args: argparse.Namespace) -> None:
         {
             "model": TEXT_MODEL,
             "messages": [{"role": "user", "content": "Reply with exactly: Agnes stream ok"}],
-            "max_tokens": 20,
             "temperature": 0,
             "stream": True,
-        }
+        },
+        base_url=TEXT_BASE_URL,
     )
     if text_stream["events"] < 1 and not text_stream["done"]:
         raise SystemExit(f"text-stream response did not look like SSE: {json.dumps(text_stream)}")
@@ -523,7 +590,6 @@ def cmd_smoke_test(args: argparse.Namespace) -> None:
         {
             "model": TEXT_MODEL,
             "messages": [{"role": "user", "content": "Use the get_test_value tool."}],
-            "max_tokens": 128,
             "temperature": 0,
             "tools": [
                 {
@@ -543,6 +609,7 @@ def cmd_smoke_test(args: argparse.Namespace) -> None:
             ],
             "tool_choice": {"type": "function", "function": {"name": "get_test_value"}},
         },
+        base_url=TEXT_BASE_URL,
     )
     check_tool_call("text-tools", text_tools, strict=args.strict_tools)
 
@@ -562,7 +629,7 @@ def cmd_smoke_test(args: argparse.Namespace) -> None:
     image_edit = None
     edited_image_url = None
     selected_cases = set(args.video_case or [])
-    needs_second_image = bool(selected_cases.intersection({"multi-image", "keyframes"}))
+    needs_second_image = "keyframe" in selected_cases
     if args.include_image_edit or needs_second_image:
         image_edit = request_json(
             "POST",
@@ -577,58 +644,48 @@ def cmd_smoke_test(args: argparse.Namespace) -> None:
         require_ok("image-to-image", image_edit, ("data",))
         edited_image_url = extract_image_url(image_edit)
 
-    video_common = {
-        "model": VIDEO_MODEL,
-    }
-    for key, value in (
-        ("height", args.video_height),
-        ("width", args.video_width),
-        ("num_frames", args.video_num_frames),
-        ("frame_rate", args.video_frame_rate),
-    ):
-        if value is not None:
-            video_common[key] = value
     video_results = {}
-    if "text-to-video" in selected_cases:
-        video_results["text_to_video"] = create_video_case(
-            "video-text-to-video",
+    if "text" in selected_cases:
+        video_results["text"] = create_video_case(
+            "video-text",
             {
-                **video_common,
+                "model": VIDEO_MODEL,
                 "prompt": "A simple cinematic shot of a red square gently moving on a white background",
+                "mode": "text",
+                "size": "720P",
+                "seconds": "4",
+                "aspect_ratio": "16:9",
             },
             args,
         )
-    if "image-to-video" in selected_cases:
-        video_results["image_to_video"] = create_video_case(
-            "video-image-to-video",
-            {
-                **video_common,
-                "prompt": "Animate the icon with subtle floating motion, stable centered composition",
-                "image": generated_image_url,
-            },
-            args,
-        )
-    if "multi-image" in selected_cases:
+    if "keyframe" in selected_cases:
         if not edited_image_url:
-            raise SystemExit("multi-image test requires an edited image URL")
-        video_results["multi_image"] = create_video_case(
-            "video-multi-image",
+            raise SystemExit("keyframe test requires an edited image URL")
+        video_results["keyframe"] = create_video_case(
+            "video-keyframe",
             {
-                **video_common,
-                "prompt": "Create a smooth transformation from the first icon to the second icon, stable centered composition",
-                "extra_body": {"image": [generated_image_url, edited_image_url]},
+                "model": VIDEO_MODEL,
+                "prompt": "Smooth cinematic transition from the first frame to the second frame, stable centered composition",
+                "mode": "keyframe",
+                "size": "720P",
+                "seconds": "4",
+                "aspect_ratio": "16:9",
+                "first_frame": generated_image_url,
+                "last_frame": edited_image_url,
             },
             args,
         )
-    if "keyframes" in selected_cases:
-        if not edited_image_url:
-            raise SystemExit("keyframes test requires an edited image URL")
-        video_results["keyframes"] = create_video_case(
-            "video-keyframes",
+    if "reference-image" in selected_cases:
+        video_results["reference_image"] = create_video_case(
+            "video-reference-image",
             {
-                **video_common,
-                "prompt": "Create a smooth keyframe transition between the two icons, stable centered composition",
-                "extra_body": {"image": [generated_image_url, edited_image_url], "mode": "keyframes"},
+                "model": VIDEO_MODEL,
+                "prompt": "Use <Picture 1> as the visual reference, gentle floating motion, stable centered composition",
+                "mode": "reference",
+                "size": "720P",
+                "seconds": "4",
+                "aspect_ratio": "16:9",
+                "images": [generated_image_url],
             },
             args,
         )
@@ -653,8 +710,10 @@ def build_parser() -> argparse.ArgumentParser:
     text.add_argument("--system")
     text.add_argument("--temperature", type=float, default=0.7)
     text.add_argument("--top-p", type=float)
-    text.add_argument("--max-tokens", type=int, default=1024)
     text.add_argument("--stream", action="store_true")
+    text.add_argument("--thinking", action="store_true", help="Enable Thinking mode via chat_template_kwargs (on by default).")
+    text.add_argument("--no-thinking", dest="thinking", action="store_false", help="Disable Thinking mode.")
+    text.set_defaults(thinking=True)
     text.add_argument("--tools-json", help="JSON array for OpenAI-compatible tool definitions.")
     text.add_argument("--tool-choice-json", help="JSON object/string for OpenAI-compatible tool_choice.")
     text.add_argument("--raw", action="store_true", help="Print the raw provider response.")
@@ -662,7 +721,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     image = sub.add_parser("image", help="Generate or edit an image.")
     image.add_argument("--prompt", required=True)
-    image.add_argument("--size", default="1024x768")
+    image.add_argument(
+        "--size",
+        default="2K",
+        help="Output size tier (1K/2K/3K/4K, default 2K) or legacy WIDTHxHEIGHT.",
+    )
+    image.add_argument(
+        "--ratio",
+        default="1:1",
+        help="Aspect ratio for tiered size (default 1:1). Supported: 1:1 3:4 4:3 16:9 9:16 2:3 3:2 21:9.",
+    )
     image.add_argument("--image", action="append", help="Input image URL. Repeat for multiple images.")
     image.add_argument(
         "--no-translate-prompt",
@@ -672,17 +740,25 @@ def build_parser() -> argparse.ArgumentParser:
     image.add_argument("--raw", action="store_true", help="Print the raw provider response.")
     image.set_defaults(func=cmd_image)
 
-    video = sub.add_parser("video", help="Create a video task.")
+    video = sub.add_parser("video", help="Create a video task with agnes-video-2.5-flash.")
     video.add_argument("--prompt", required=True)
-    video.add_argument("--image", action="append", help="Input image URL. Repeat for multi-image or keyframes.")
-    video.add_argument("--mode", choices=("ti2vid", "keyframes"))
-    video.add_argument("--height", type=int)
-    video.add_argument("--width", type=int)
-    video.add_argument("--num-frames", type=int, default=121)
-    video.add_argument("--frame-rate", type=float, default=24)
-    video.add_argument("--num-inference-steps", type=int)
+    video.add_argument(
+        "--mode",
+        choices=("text", "keyframe", "reference"),
+        help="Defaults inferred from media: frames -> keyframe, images/audios -> reference, else text.",
+    )
+    video.add_argument("--seconds", default="5", help="Video duration as integer 4-12 (default 5).")
+    video.add_argument("--size", default="720P", help="Fixed to 720P on agnes-video-2.5-flash.")
+    video.add_argument(
+        "--aspect-ratio",
+        default="16:9",
+        help="21:9 16:9 4:3 1:1 3:4 9:16 (default 16:9).",
+    )
     video.add_argument("--seed", type=int)
-    video.add_argument("--negative-prompt")
+    video.add_argument("--first-frame", help="First frame image URL (keyframe mode).")
+    video.add_argument("--last-frame", help="Last frame image URL (keyframe mode).")
+    video.add_argument("--image", action="append", help="Reference image URL, repeat up to 5 (reference mode).")
+    video.add_argument("--audio", action="append", help="Reference audio URL, repeat up to 3 (reference mode).")
     video.add_argument(
         "--no-translate-prompt",
         action="store_true",
@@ -702,11 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
     video_get.set_defaults(func=cmd_video_get)
 
     smoke = sub.add_parser("smoke-test", help="Run live text, image, and video API tests.")
-    smoke.add_argument("--image-size", default="1024x768")
-    smoke.add_argument("--video-height", type=int)
-    smoke.add_argument("--video-width", type=int)
-    smoke.add_argument("--video-num-frames", type=int, default=81)
-    smoke.add_argument("--video-frame-rate", type=float, default=24)
+    smoke.add_argument("--image-size", default="1K")
     smoke.add_argument("--include-image-edit", action="store_true", help="Also test image-to-image editing.")
     smoke.add_argument("--strict-tools", action="store_true", help="Fail if the tool-calling response has no tool_calls.")
     smoke.add_argument("--poll-video", action="store_true")

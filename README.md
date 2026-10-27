@@ -12,21 +12,22 @@
 
 ## 功能
 
-- 文本生成：`agnes-2.0-flash`
+- 文本生成：`agnes-3.0-flash`（Thinking 模式默认开启，可用 `--no-thinking` 关闭）
 - 流式文本响应
 - OpenAI 兼容的工具调用请求结构
-- 文生图：`agnes-image-2.1-flash`
-- 图生图 / 图片编辑：`agnes-image-2.1-flash`
+- 文生图：`agnes-image-2.5-flash`（默认 `2K` 档位 + `1:1` 画幅，支持 `--size` 档位/精确尺寸与 `--ratio`）
+- 图生图 / 图片编辑 / 多图合成：`agnes-image-2.5-flash`
 - 高信息密度图片生成
-- 文本转视频：`agnes-video-v2.0`
-- 图像转视频：`agnes-video-v2.0`
-- 多图像视频生成
-- 关键帧动画
+- 文生视频：`agnes-video-2.5-flash`
+- 首尾帧控制视频（keyframe 模式）
+- 图片参考 / 音频参考视频（reference 模式）
+- 视频时长控制：`--seconds`（4–12 秒，默认 5）
+- 模式自动推断：提供帧图 → keyframe，提供图/音参考 → reference，否则 text
 - 基于提示词的运动与场景控制
 - 电影感视觉输出
-- 异步视频任务创建
-- 轮询式视频结果检索
+- 异步视频任务创建与轮询检索
 - 基于 seed 的可重复生成
+- 503 视频队列满自动退避重试
 - 自动将非英文图片/视频提示词翻译为英文提示词，提高 Agnes 视频生成稳定性
 
 ## 快速开始
@@ -100,11 +101,19 @@ Windows 用户级持久配置：
 python scripts/agnes_api.py text --prompt "Write a concise product tagline for an AI assistant."
 ```
 
-文生图：
+文生图（默认 `2K` 档位 + `1:1` 画幅）：
 
 ```powershell
-python scripts/agnes_api.py image --prompt "A luminous floating city above a misty canyon at sunrise, cinematic realism" --size 1024x768
+python scripts/agnes_api.py image --prompt "A luminous floating city above a misty canyon at sunrise, cinematic realism"
 ```
+
+指定档位尺寸与画幅比例：
+
+```powershell
+python scripts/agnes_api.py image --prompt "A cinematic desktop wallpaper, clean lighting" --size 2K --ratio 16:9
+```
+
+`--size` 支持 `1K`/`2K`/`3K`/`4K` 档位（默认 `2K`）或历史精确尺寸（如 `1024x768`，不支持的精确尺寸可能被服务端标准化）；`--ratio` 仅用于档位尺寸，支持 `1:1 3:4 4:3 16:9 9:16 2:3 3:2 21:9`。
 
 中文提示词文生图，脚本会先自动翻译成英文：
 
@@ -118,24 +127,34 @@ python scripts/agnes_api.py image --prompt "一座高信息密度的未来城市
 python scripts/agnes_api.py image --prompt "Turn the scene into a rainy cyberpunk night while preserving composition" --image https://example.com/input.png
 ```
 
-文生视频：
+文生视频（默认 5 秒、720P、16:9）：
 
 ```powershell
 python scripts/agnes_api.py video --prompt "A cinematic shot of a cat walking on the beach at sunset" --poll
 ```
 
-视频命令默认使用 `--num-frames 121 --frame-rate 24`，以减少缺少关键视频参数导致的不稳定。脚本会在请求前检查 `num_frames` 是否满足 `8n + 1` 且不超过 `441`，并检查帧率、尺寸等基础参数。
-
-图生视频：
+指定时长与画幅：
 
 ```powershell
-python scripts/agnes_api.py video --prompt "Animate subtle camera movement and natural lighting" --image https://example.com/image.png --poll
+python scripts/agnes_api.py video --prompt "Neon-lit street after rain, cinematic camera move" --seconds 8 --aspect-ratio 21:9 --poll
 ```
 
-多图 / 关键帧视频：
+图片参考视频（模式自动推断为 `reference`，提示词中用 `<Picture N>` 指代素材）：
 
 ```powershell
-python scripts/agnes_api.py video --prompt "Create a smooth cinematic transition between the two keyframes" --image https://example.com/a.png --image https://example.com/b.png --mode keyframes --poll
+python scripts/agnes_api.py video --prompt "Use <Picture 1> as the character reference, natural motion" --image https://example.com/character.png --poll
+```
+
+音频参考视频（可与图片参考同时使用，最多 3 段）：
+
+```powershell
+python scripts/agnes_api.py video --prompt "Follow the rhythm of <Audio 1>, cinematic night driving" --audio https://example.com/music.mp3 --poll
+```
+
+首尾帧控制视频（模式自动推断为 `keyframe`）：
+
+```powershell
+python scripts/agnes_api.py video --prompt "Smooth transition from first frame to last frame" --first-frame https://example.com/first.png --last-frame https://example.com/last.png --poll
 ```
 
 查询视频任务：
@@ -144,13 +163,15 @@ python scripts/agnes_api.py video --prompt "Create a smooth cinematic transition
 python scripts/agnes_api.py video-get video_123456
 ```
 
+Flash 版限制：`size` 固定为 `720P`，`seconds` 为 4–12 的整数，参考图片最多 5 张、参考音频最多 3 段，不支持参考视频输入。创建请求遇 `503 video_queue_full` 时脚本会自动退避重试（最多 6 次）。
+
 默认输出会整理出常用字段，例如 `content`、`urls`、`translated_prompt`、`next_steps`，同时保留 `raw` 原始响应，方便 AI 和人工继续处理。
 
 默认情况下，生成图片或视频后直接返回 `urls` 即可；除非用户明确要求下载、保存或检查本地文件，否则不需要把媒体下载到本地。
 
 流式文本也会聚合输出 `content`，同时保留事件数量、是否完成和原始响应前缀，便于快速判断流式接口是否正常。
 
-视频创建接口如果返回 `video_id`，脚本会优先使用新版 `video_id` 查询接口：`/agnesapi?video_id=...`。如果旧响应没有 `video_id`，脚本才回退到兼容的 `task_id` 查询接口。视频完成后，脚本会从 `video_url`、`url` 或 Agnes 实测返回中的 `remixed_from_video_id` 提取可直接访问的 mp4 链接，并放入 `urls`。
+视频创建接口如果返回 `video_id`，脚本会优先使用新版 `video_id` 查询接口：`/agnesapi?video_id=...&model_name=agnes-video-2.5-flash`。如果 `video_id` 是 `task_...` 形式，脚本回退到兼容的 `task_id` 查询接口。视频完成后，脚本会从 `video_url`、`url`、`metadata.url`（2026-10-27 实测新站将 mp4 放在 `metadata.url`）或 `remixed_from_video_id` 提取可直接访问的 mp4 链接，并放入 `urls`。
 
 注意：Agnes Responses API 的多轮函数调用目前不适合作为 Codex / Claude Code 这类 agent 的自动工具循环模型。本 skill 的脚本使用 chat completions 路径；工具调用只应视为请求结构兼容能力，而不是稳定的多轮工具执行能力。
 
@@ -181,19 +202,18 @@ python scripts/agnes_api.py smoke-test --include-image-edit
 单独测试某个视频能力，避免一次创建太多视频任务：
 
 ```powershell
-python scripts/agnes_api.py smoke-test --video-case text-to-video
+python scripts/agnes_api.py smoke-test --video-case text
 ```
 
 可选的视频测试项：
 
-- `text-to-video`
-- `image-to-video`
-- `multi-image`
-- `keyframes`
+- `text`
+- `keyframe`（同时测试图生图以获得两帧素材）
+- `reference-image`
 
 ## 提示词语言策略
 
-Agnes 视频生成使用英文提示词更稳定。因此本 skill 的脚本默认会检测图片/视频提示词中的非英文字符，并先调用 `agnes-2.0-flash` 翻译成英文生成提示词，再调用图片或视频 API。
+Agnes 视频生成使用英文提示词更稳定。因此本 skill 的脚本默认会检测图片/视频提示词中的非英文字符，并先调用 `agnes-3.0-flash` 翻译成英文生成提示词，再调用图片或视频 API。
 
 翻译时会保留：
 
@@ -220,29 +240,26 @@ python scripts/agnes_api.py video --prompt "中文提示词" --no-translate-prom
 
 ## 测试状态
 
-已通过真实 API 测试：
+2026-10-27 全量迁移到 `https://api.agnes-ai.cn` 后，已通过真实 API 测试（新站）：
 
-- 基础文本生成
+- 基础文本生成（`agnes-3.0-flash`）
 - 流式文本
-- 工具调用请求结构
-- 文生图
+- Thinking 模式（默认开启与 `--no-thinking`）
+- 文生图默认 2K+1:1（实测输出 2048x2048）
+- 指定 2K+16:9（实测输出 2624x1472）
+- 精确尺寸 1024x768 被服务端标准化为 1152x864（符合文档预期）
 - 图生图
-- 高信息密度文生图
-- 中文提示词自动翻译后文生图
-- 中文提示词自动翻译后文生视频任务创建
-- 文生视频完成并返回 mp4 URL
-- 图生视频完成并返回 mp4 URL
+- 无效图片 URL 返回清晰 400 错误
+- 中文提示词自动翻译后文生图 / 文生视频
+- 文生视频完成并返回 mp4 URL（`metadata.url`，720P 4 秒）
 
-已支持但本轮未完整端到端重测：
+已按官方文档实现、参数校验已本地验证，但尚未完整端到端实测（测试期间服务端持续返回 `503 video_queue_full`，免费队列饱和）：
 
-- 多图视频
-- 关键帧视频
+- 首尾帧控制视频（keyframe 模式）
+- 图片参考视频（reference 模式，图片）
+- 音频参考视频（reference 模式，音频；从未实测）
 
-尚未完整端到端验证：
-
-- 每一种多图视频 / 关键帧视频任务都成功返回最终视频 URL
-
-说明：曾有一次真实文生视频任务在查询时返回 Agnes 服务端 `division by zero` 错误；后续短文生视频任务已成功完成并返回 mp4 URL。因此视频能力在 skill 中已支持，但仍建议逐个模式测试并保留 provider 错误信息。
+说明：队列满为服务端瞬时拥塞，脚本已内置退避重试；建议逐个模式测试并保留 provider 错误信息。
 
 ## 仓库结构
 
